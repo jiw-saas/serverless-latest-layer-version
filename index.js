@@ -137,6 +137,9 @@ class ServerlessPlugin {
   }
 
   debug(...args) {
+    if (!this.options.verbose) {
+      return;
+    }
     const TAG = '[serverless-latest-layer-version]';
 
     if (typeof args[0] === 'string') {
@@ -145,7 +148,7 @@ class ServerlessPlugin {
       args.unshift(TAG);
     }
 
-    this.serverless.cli.debug(util.format(...args));
+    this.serverless.cli.log(util.format(...args));
   }
 }
 
