@@ -22,14 +22,13 @@
     "url": "https://github.com/mooyoul/serverless-latest-layer-version/issues"
   },
   "homepage": "https://github.com/mooyoul/serverless-latest-layer-version#readme",
-  "dependencies": {
-    "traverse": "^0.6.6"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@prescott/commitlint-preset": "1.0.9",
     "@prescott/semantic-release-config": "1.0.17",
-    "husky": "4.3.8",
-    "semantic-release": "17.4.7"
+    "husky": "9.0.11",
+    "semantic-release": "23.0.4",
+    "serverless": "^3.38.0"
   },
   "config": {
     "commitizen": {
