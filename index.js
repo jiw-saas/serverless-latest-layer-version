@@ -4,11 +4,12 @@
  * This Serverless plugin replaces 'latest' pseudo version tag to actual latest version
  */
 
-const traverse = require('traverse');
 const util = require('util');
+const reg = /^arn:aws:lambda:(?<region>[^:]+):(?<accountId>[^:]+):layer:(?<layerName>[^:]+):serverless-latest-layer-version$/;
 
 class ServerlessPlugin {
   constructor(serverless, options) {
+
     this.serverless = serverless;
     this.provider = serverless.getProvider("aws");
     this.options = options;
@@ -30,173 +31,112 @@ class ServerlessPlugin {
     return this.update(this.listCFNLayerAssociations());
   }
 
-  async update(layerAssociations) {
-    // Collect target Layer ARNs
-    const collectedLayerARNs = this.collectLayerARNs(layerAssociations);
+  async update(layersList) {
+    const layerAssociation = {};
 
-    // Resolve actual Layer ARNs
-    const resolvedLayerARNs = await this.fetchLatestVersions(collectedLayerARNs);
+    for (const layers of layersList) {
+      if (!Array.isArray(layers)) {
+        continue
+      }
+      layers.forEach(
+        (layer, index) => {
+          const layerName = this.extractLayerName(layer);
+          if (!layerName) {
+            return;
+          }
+          const listener = (newLayer) => {
+            layers[index] = newLayer;
+          };
+          let listeners = layerAssociation[layerName];
+          if (!listeners) {
+            layerAssociation[layerName] = [listener];
+          } else {
+            listeners.push(listener);
+          }
+        }
+      )
+    }
 
-    // Recursively replace layer ARNs
-    this.replaceLayerVersions(layerAssociations, resolvedLayerARNs);
+    await Promise.all(
+      Object.entries(layerAssociation)
+        .map(([layerName, listeners]) => this.processLayers(layerName, listeners))
+    );
   }
 
   listCFNLayerAssociations() {
     // Lookup compiled CFN template to support individual deployments
     const compiledTemplate = this.serverless.service.provider.compiledCloudFormationTemplate;
-
-    const resources = compiledTemplate.Resources;
-
-    return Object.keys(resources).reduce((collection, key) => {
-      const resource = resources[key];
-
-      if (resource.Type === 'AWS::Lambda::Function') {
-        const layers = resource.Properties && resource.Properties.Layers;
-
-        if (Array.isArray(layers) && layers.length > 0) {
-          collection.push({ name: key, layers });
-        }
-      }
-
-      return collection;
-    }, []);
+    return Object.values(compiledTemplate.Resources)
+      .filter(({ Type }) => Type === 'AWS::Lambda::Function')
+      .map(resource => resource.Properties?.Layers);
   }
 
   listSLSLayerAssociations() {
-    const { functions } = this.serverless.service;
-
-    return Object.keys(functions).reduce((collection, name) => {
-      const fn = functions[name];
-      const layers = fn.layers;
-
-      if (Array.isArray(layers) && layers.length > 0) {
-        collection.push({ name, layers });
-      }
-
-      return collection;
-    }, []);
+    return Object.values(this.serverless.service?.functions ?? {}).map(({ layers }) => layers);
   }
 
-  async lookupLatestLayerVersionArn(layerArn) {
-    const layer = this.extractLayerArn(layerArn);
+  async processLayers(layerName, listeners) {
+    let latestVersion;
 
-    if (!layer) {
-      return null;
-    }
-
-    const versions = [];
-
+    this.debug("Fetching versions for", layerName);
     let marker;
     do {
       const result = await this.provider.request("Lambda", "listLayerVersions", {
-        LayerName: layer.layerName,
+        LayerName: layerName,
         Marker: marker,
       });
-
-      versions.push(...result.LayerVersions);
+      this.debug("Result", result);
+      for (const version of result.LayerVersions) {
+        if (latestVersion && latestVersion.Version > version.Version) {
+          continue;
+        }
+        latestVersion = version;
+      }
       marker = result.NextMarker;
     } while (marker);
 
-    const sortedVersions = versions.sort((a, b) => {
-      if (a.Version > b.Version) {
-        return -1;
-      } else if (a.Version < b.Version) {
-        return 1
-      } else {
-        return 0;
-      }
-    });
-
-    return sortedVersions.length > 0 ?
-      sortedVersions[0].LayerVersionArn :
-      null;
-  }
-
-  extractLayerArn(arn) {
-    const SEPARATOR = "__SEPARATOR__";
-
-    // arn:aws:lambda:REGION:ACCOUNT_ID:layer:LAYER_NAME:LAYER_VERSION
-    const tokens = arn.replace(/([^:]):([^:])/g, (match, prev, next) => `${prev}${SEPARATOR}${next}`).split(SEPARATOR);
-
-    if (tokens.length !== 8) {
-      return null;
+    if (!latestVersion) {
+      throw new Error(`Lambda layer ${layerName} has no version available.`);
+      return;
+    } else {
+      this.debug(`Latest version for ${layerName} → `, latestVersion);
     }
 
-    let region = tokens[3];
-    if (/AWS::Region/i.test(region)) {
+    for (const listener of listeners) {
+      listener(latestVersion.LayerVersionArn);
+    }
+  }
+
+  extractLayerName(layer) {
+    if (!layer) {
+      return;
+    }
+    if (typeof layer !== 'string') {
+      this.debug('Skipping layer as its not a string:', layer);
+      return;
+    }
+    const tokens = reg.exec(layer)
+    if (!tokens) {
+      this.debug(`Skipping layer ${layer} as it doesn't match regexp: ${reg}`);
+      return;
+    }
+
+    let { region, accountId, layerName, layerVersion } = tokens.groups || {};
+    if (layerVersion === '?') {
+      layerVersion = 'latest'
+    } else if (layerVersion === parseInt(layerVersion)) {
+      this.debug(`Skipping layer ${layer} as it has a clearly specified layer version.`);
+      return;
+    }
+    if (region === "?") {
       region = this.serverless.service.provider.region;
     }
-
-    const accountId = tokens[4];
-    const layerName = tokens[6];
-
-    return {
-      region,
-      layerName: /AWS::AccountId/i.test(accountId) ?
-        layerName :
-        `arn:aws:lambda:${region}:${accountId}:layer:${layerName}`,
-    };
+    return accountId === "?"
+        ? layerName
+        : `arn:aws:lambda:${region}:${accountId}:layer:${layerName}`;
   }
 
-  collectLayerARNs(layerAssociations) {
-    const set = new Set();
-
-    for (const layerAssociation of layerAssociations) {
-      traverse(layerAssociation.layers).forEach(function (node) {
-        const matched = this.isLeaf
-          && typeof node === "string"
-          && /^arn:/i.test(node)
-          && /latest$/i.test(node);
-
-        if (matched) {
-          set.add(node);
-        }
-      });
-    }
-
-    return set;
-  }
-
-  async fetchLatestVersions(layerARNs) {
-    const dict = new Map();
-
-    for (const layerARN of layerARNs) {
-      const version = await this.lookupLatestLayerVersionArn(layerARN);
-      dict.set(layerARN, version);
-    }
-
-    return dict;
-  }
-
-  replaceLayerVersions(layerAssociations, arnVersionMap) {
-    const self = this;
-
-    for (const layerAssociation of layerAssociations) {
-      traverse(layerAssociation.layers).forEach(function (node) {
-        const matched = this.isLeaf
-          && typeof node === "string"
-          && /^arn:/i.test(node)
-          && /latest$/i.test(node);
-
-        if (matched) {
-          const resolvedLayerArn = arnVersionMap.get(node);
-          if (resolvedLayerArn) {
-            this.update(resolvedLayerArn);
-            // Avoid logging the same resolved layer multiple times
-            if (self.resolvedLayers.has(resolvedLayerArn)) {
-              return;
-            }
-            self.resolvedLayers.add(resolvedLayerArn);
-            self.log("Resolved %s to %s", node, resolvedLayerArn);
-          } else {
-            self.log("Detected unknown Layer ARN %s. Please create a new issue to github.com/mooyoul/serverless-latest-layer-version", node);
-          }
-        }
-      });
-    }
-  }
-
-  log(...args) {
+  debug(...args) {
     const TAG = '[serverless-latest-layer-version]';
 
     if (typeof args[0] === 'string') {
@@ -205,7 +145,7 @@ class ServerlessPlugin {
       args.unshift(TAG);
     }
 
-    this.serverless.cli.log(util.format(...args));
+    this.serverless.cli.debug(util.format(...args));
   }
 }
 
